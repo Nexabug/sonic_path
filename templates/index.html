@@ -1,0 +1,589 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>VisionSound — AI Depth Assist</title>
+<link href="https://fonts.googleapis.com/css2?family=Space+Mono:wght@400;700&family=Syne:wght@400;700;800&display=swap" rel="stylesheet">
+<style>
+  :root {
+    --bg: #050a0e; --surface: #0d1f2d; --surface2: #112233;
+    --accent: #00ffc3; --accent2: #00aaff; --warn: #ffaa00; --danger: #ff3b3b;
+    --text: #cde8f0; --muted: #4a7a90; --border: rgba(0,255,195,0.15);
+    --font-display: 'Syne', sans-serif; --font-mono: 'Space Mono', monospace;
+  }
+  * { margin:0; padding:0; box-sizing:border-box; }
+  body { background:var(--bg); color:var(--text); font-family:var(--font-mono); min-height:100vh; overflow-x:hidden; }
+  body::before {
+    content:''; position:fixed; inset:0; pointer-events:none; z-index:0;
+    background-image: linear-gradient(rgba(0,255,195,0.03) 1px,transparent 1px),
+                      linear-gradient(90deg,rgba(0,255,195,0.03) 1px,transparent 1px);
+    background-size:40px 40px;
+  }
+  .wrapper { position:relative; z-index:1; max-width:1200px; margin:0 auto; padding:24px; }
+
+  header { display:flex; align-items:center; justify-content:space-between; border-bottom:1px solid var(--border); padding-bottom:18px; margin-bottom:24px; }
+  .logo { display:flex; align-items:center; gap:14px; }
+  .logo-icon { width:44px; height:44px; border-radius:10px; background:linear-gradient(135deg,var(--accent),var(--accent2)); display:flex; align-items:center; justify-content:center; font-size:22px; box-shadow:0 0 20px rgba(0,255,195,0.3); }
+  h1 { font-family:var(--font-display); font-size:26px; font-weight:800; background:linear-gradient(90deg,var(--accent),var(--accent2)); -webkit-background-clip:text; -webkit-text-fill-color:transparent; }
+  .tagline { font-size:10px; color:var(--muted); letter-spacing:2px; text-transform:uppercase; margin-top:2px; }
+
+  .status-bar { display:flex; gap:20px; }
+  .status-pill { display:flex; align-items:center; gap:7px; font-size:11px; color:var(--muted); letter-spacing:1px; text-transform:uppercase; }
+  .dot { width:8px; height:8px; border-radius:50%; background:var(--muted); transition:all 0.3s; }
+  .dot.live { background:var(--accent); box-shadow:0 0 8px var(--accent); animation:pulse-dot 1.5s infinite; }
+  @keyframes pulse-dot { 0%,100%{opacity:1;transform:scale(1)} 50%{opacity:0.5;transform:scale(0.8)} }
+
+  .controls { display:flex; gap:10px; margin-bottom:22px; flex-wrap:wrap; align-items:center; }
+  .select-wrap { position:relative; }
+  select { appearance:none; background:var(--surface); border:1px solid var(--border); color:var(--text); padding:9px 34px 9px 14px; border-radius:8px; font-family:var(--font-mono); font-size:12px; cursor:pointer; outline:none; transition:border-color 0.2s; }
+  select:hover,select:focus { border-color:var(--accent); }
+  .select-arrow { position:absolute; right:10px; top:50%; transform:translateY(-50%); color:var(--muted); pointer-events:none; font-size:10px; }
+  .btn { padding:9px 18px; border-radius:8px; border:1px solid var(--border); background:var(--surface); color:var(--accent); font-family:var(--font-mono); font-size:12px; cursor:pointer; transition:all 0.2s; display:flex; align-items:center; gap:7px; }
+  .btn:hover { background:rgba(0,255,195,0.08); border-color:var(--accent); }
+  .btn.active { background:rgba(0,255,195,0.15); border-color:var(--accent); }
+
+  .main-grid { display:grid; grid-template-columns:1fr 360px; gap:18px; margin-bottom:18px; }
+
+  .video-panel { background:var(--surface); border:1px solid var(--border); border-radius:16px; overflow:hidden; }
+  .panel-header { display:flex; align-items:center; justify-content:space-between; padding:12px 16px; border-bottom:1px solid var(--border); font-size:11px; text-transform:uppercase; letter-spacing:2px; color:var(--muted); }
+  .panel-header span { color:var(--accent); }
+  .video-wrap { position:relative; line-height:0; background:#000; }
+  .video-wrap img { width:100%; display:block; }
+  .danger-overlay { position:absolute; inset:0; pointer-events:none; border:3px solid transparent; transition:all 0.15s; z-index:2; }
+  .danger-overlay.danger { border-color:var(--danger); box-shadow:inset 0 0 40px rgba(255,59,59,0.25); animation:flash-border 0.4s ease-in-out infinite alternate; }
+  @keyframes flash-border { from{opacity:1} to{opacity:0.3} }
+
+  .right-panel { display:flex; flex-direction:column; gap:14px; }
+  .card { background:var(--surface); border:1px solid var(--border); border-radius:14px; overflow:hidden; }
+  .card-body { padding:16px; }
+
+  /* ZONE BARS */
+  .zones { display:flex; flex-direction:column; gap:13px; }
+  .zone { display:grid; grid-template-columns:58px 1fr 48px; align-items:center; gap:10px; }
+  .zone-label { font-size:10px; letter-spacing:2px; text-transform:uppercase; color:var(--muted); }
+  .zone-bar-wrap { height:10px; background:rgba(255,255,255,0.05); border-radius:5px; overflow:hidden; }
+  .zone-bar { height:100%; border-radius:5px; transition:width 0.25s cubic-bezier(0.4,0,0.2,1), background 0.25s; }
+  .zone-bar.safe   { background:linear-gradient(90deg,#00ffc3,#00e0aa); }
+  .zone-bar.warn   { background:linear-gradient(90deg,#ffaa00,#ff8800); }
+  .zone-bar.danger { background:linear-gradient(90deg,#ff3b3b,#cc0000); }
+  .zone-value { font-size:15px; font-weight:700; text-align:right; color:var(--accent); transition:color 0.25s; }
+  .zone-value.warn   { color:var(--warn); }
+  .zone-value.danger { color:var(--danger); }
+
+  /* ALERT BOX */
+  .alert-box { background:var(--surface2); border:1px solid rgba(255,59,59,0.15); border-radius:10px; padding:12px 14px; font-size:12px; color:var(--muted); min-height:46px; display:flex; align-items:center; gap:10px; transition:all 0.25s; }
+  .alert-box.active { border-color:var(--danger); color:var(--danger); background:rgba(255,59,59,0.08); box-shadow:0 0 15px rgba(255,59,59,0.2); }
+  .alert-icon { font-size:18px; flex-shrink:0; }
+
+  /* AUDIO PANEL */
+  .audio-direction {
+    display:grid; grid-template-columns:1fr 1fr 1fr; gap:8px; margin-top:4px;
+  }
+  .dir-cell {
+    background:var(--surface2); border-radius:10px; padding:14px 8px; text-align:center;
+    border:1px solid rgba(255,255,255,0.04); transition:all 0.2s;
+    position:relative; overflow:hidden;
+  }
+  .dir-cell.beeping {
+    border-color:var(--danger);
+    box-shadow:0 0 15px rgba(255,59,59,0.3);
+    background:rgba(255,59,59,0.08);
+  }
+  .dir-cell.warn-zone {
+    border-color:var(--warn);
+    box-shadow:0 0 10px rgba(255,170,0,0.2);
+  }
+  .dir-icon { font-size:24px; line-height:1; }
+  .dir-label { font-size:9px; color:var(--muted); letter-spacing:2px; text-transform:uppercase; margin-top:5px; }
+  .dir-status { font-size:10px; color:var(--muted); margin-top:4px; transition:color 0.2s; }
+  .dir-status.active { color:var(--danger); font-weight:700; }
+
+  /* BEEP INDICATOR */
+  .beep-ring {
+    position:absolute; border-radius:50%; border:2px solid var(--danger);
+    animation:beep-expand 0.6s ease-out forwards; pointer-events:none;
+  }
+  @keyframes beep-expand {
+    0%  { width:10px; height:10px; top:50%; left:50%; transform:translate(-50%,-50%); opacity:0.9; }
+    100%{ width:80px; height:80px; top:50%; left:50%; transform:translate(-50%,-50%); opacity:0; }
+  }
+
+  /* STATS */
+  .stats-row { display:grid; grid-template-columns:repeat(4,1fr); gap:12px; margin-bottom:18px; }
+  .stat-cell { background:var(--surface); border:1px solid var(--border); border-radius:12px; padding:14px; text-align:center; }
+  .stat-value { font-size:26px; font-weight:700; font-family:var(--font-display); color:var(--accent); line-height:1; }
+  .stat-label { font-size:9px; color:var(--muted); letter-spacing:2px; text-transform:uppercase; margin-top:5px; }
+
+  footer { border-top:1px solid var(--border); padding-top:14px; display:flex; justify-content:space-between; font-size:10px; color:var(--muted); letter-spacing:1px; }
+
+  @media (max-width:900px) {
+    .main-grid { grid-template-columns:1fr; }
+    .stats-row { grid-template-columns:repeat(2,1fr); }
+  }
+</style>
+</head>
+<body>
+<div class="wrapper">
+
+  <header>
+    <div class="logo">
+      <div class="logo-icon">👁</div>
+      <div>
+        <h1>VisionSound</h1>
+        <div class="tagline">Depth → Spatial Audio Assist for Visual Impairments</div>
+      </div>
+    </div>
+    <div class="status-bar">
+      <div class="status-pill"><div class="dot" id="camDot"></div><span id="camStatus">NO FEED</span></div>
+      <div class="status-pill"><div class="dot" id="audioDot"></div><span id="audioStatus">AUDIO OFF</span></div>
+    </div>
+  </header>
+
+  <div class="controls">
+    <div class="select-wrap">
+      <select id="cameraSelect"><option value="">— Camera —</option></select>
+      <span class="select-arrow">▼</span>
+    </div>
+    <button class="btn" id="audioBtn" onclick="toggleAudio()">🔊 Enable Audio</button>
+    <button class="btn" id="speechBtn" onclick="toggleSpeech()">🗣 Voice Alerts</button>
+    <button class="btn" onclick="triggerHaptic([100,50,100])">📳 Test Haptic</button>
+    <div class="select-wrap">
+      <select id="sensSelect" onchange="updateThreshold(this.value)">
+        <option value="180">Low Sensitivity</option>
+        <option value="150" selected>Medium Sensitivity</option>
+        <option value="120">High Sensitivity</option>
+      </select>
+      <span class="select-arrow">▼</span>
+    </div>
+  </div>
+
+  <div class="main-grid">
+    <div class="video-panel">
+      <div class="panel-header"><span>LIVE DEPTH MAP</span><span id="fpsDisplay">-- FPS</span></div>
+      <div class="video-wrap">
+        <img src="/video" alt="Depth feed" id="videoFeed">
+        <div class="danger-overlay" id="dangerOverlay"></div>
+      </div>
+    </div>
+
+    <div class="right-panel">
+      <!-- ZONES -->
+      <div class="card">
+        <div class="panel-header"><span>PROXIMITY ZONES</span></div>
+        <div class="card-body">
+          <div class="zones">
+            <div class="zone">
+              <div class="zone-label">LEFT</div>
+              <div class="zone-bar-wrap"><div class="zone-bar safe" id="leftBar" style="width:0%"></div></div>
+              <div class="zone-value" id="leftVal">0</div>
+            </div>
+            <div class="zone">
+              <div class="zone-label">CENTER</div>
+              <div class="zone-bar-wrap"><div class="zone-bar safe" id="centerBar" style="width:0%"></div></div>
+              <div class="zone-value" id="centerVal">0</div>
+            </div>
+            <div class="zone">
+              <div class="zone-label">RIGHT</div>
+              <div class="zone-bar-wrap"><div class="zone-bar safe" id="rightBar" style="width:0%"></div></div>
+              <div class="zone-value" id="rightVal">0</div>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <!-- ALERT -->
+      <div class="card">
+        <div class="panel-header"><span>PROXIMITY ALERT</span></div>
+        <div class="card-body">
+          <div class="alert-box" id="alertBox">
+            <span class="alert-icon">🟢</span>
+            <span id="alertText">All clear — path is safe</span>
+          </div>
+        </div>
+      </div>
+
+      <!-- SPATIAL AUDIO DIRECTION -->
+      <div class="card">
+        <div class="panel-header"><span>SPATIAL AUDIO</span><span id="beepStatus">SILENT</span></div>
+        <div class="card-body">
+          <div class="audio-direction">
+            <div class="dir-cell" id="dirLeft">
+              <div class="dir-icon">👈</div>
+              <div class="dir-label">LEFT</div>
+              <div class="dir-status" id="dirLeftStatus">clear</div>
+            </div>
+            <div class="dir-cell" id="dirCenter">
+              <div class="dir-icon">⬆️</div>
+              <div class="dir-label">AHEAD</div>
+              <div class="dir-status" id="dirCenterStatus">clear</div>
+            </div>
+            <div class="dir-cell" id="dirRight">
+              <div class="dir-icon">👉</div>
+              <div class="dir-label">RIGHT</div>
+              <div class="dir-status" id="dirRightStatus">clear</div>
+            </div>
+          </div>
+          <div style="font-size:10px;color:var(--muted);text-align:center;margin-top:12px;letter-spacing:1px;">
+            BEEP PANNED TO OBSTACLE DIRECTION · RATE = PROXIMITY
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <div class="stats-row">
+    <div class="stat-cell"><div class="stat-value" id="statStreamFps">0</div><div class="stat-label">Stream FPS</div></div>
+    <div class="stat-cell"><div class="stat-value" id="statDepthFps">0</div><div class="stat-label">Depth FPS</div></div>
+    <div class="stat-cell"><div class="stat-value" id="statAlerts">0</div><div class="stat-label">Alerts</div></div>
+    <div class="stat-cell"><div class="stat-value" id="statPeak">0</div><div class="stat-label">Peak Depth</div></div>
+  </div>
+
+  <footer>
+    <span>VISIONSOUND v2.0 · HACKATHON BUILD</span>
+    <span id="lastUpdate">—</span>
+  </footer>
+</div>
+
+<script>
+// ══════════════════════════════════════════════════════════════════════
+// STATE
+// ══════════════════════════════════════════════════════════════════════
+let audioEnabled  = false;
+let speechEnabled = false;
+let audioCtx      = null;
+let beepTimeout   = null;   // handle for scheduled next beep
+let alertCount    = 0;
+let peakDepth     = 0;
+let dangerThreshold = 150;
+
+let lastSpeechTime = 0;
+let lastHapticTime = 0;
+let lastAlertTime  = 0;
+
+// Current beep state
+let beepState = {
+  active:    false,
+  pan:       0,      // -1 left, 0 center, +1 right
+  intervalMs: 800,   // ms between beeps (shorter = closer)
+};
+
+// ══════════════════════════════════════════════════════════════════════
+// AUDIO ENGINE — parking sensor style
+// ══════════════════════════════════════════════════════════════════════
+function initAudio() {
+  audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+}
+
+/**
+ * Play a single short directional beep.
+ * pan: -1 = hard left, 0 = centre, +1 = hard right
+ * freq: pitch of the beep
+ */
+function playBeep(pan, freq = 880, durationMs = 80) {
+  if (!audioCtx) return;
+
+  const osc    = audioCtx.createOscillator();
+  const gain   = audioCtx.createGain();
+  const panner = audioCtx.createStereoPanner();
+
+  osc.type          = 'sine';
+  osc.frequency.value = freq;
+  panner.pan.value  = pan;
+
+  // Short attack + sharp decay = clean beep
+  const now = audioCtx.currentTime;
+  gain.gain.setValueAtTime(0, now);
+  gain.gain.linearRampToValueAtTime(0.6, now + 0.008);
+  gain.gain.exponentialRampToValueAtTime(0.001, now + durationMs / 1000);
+
+  osc.connect(gain);
+  gain.connect(panner);
+  panner.connect(audioCtx.destination);
+
+  osc.start(now);
+  osc.stop(now + durationMs / 1000 + 0.01);
+}
+
+/**
+ * Start a repeating beep loop — like a parking sensor.
+ * intervalMs: 600ms (warn) down to 100ms (critical = almost continuous)
+ */
+function startBeeping(pan, intervalMs, freq) {
+  stopBeeping();
+  beepState = { active: true, pan, intervalMs, freq };
+
+  function loop() {
+    if (!beepState.active || !audioEnabled) return;
+    playBeep(beepState.pan, beepState.freq);
+    beepTimeout = setTimeout(loop, beepState.intervalMs);
+  }
+  loop();
+}
+
+function stopBeeping() {
+  beepState.active = false;
+  if (beepTimeout) { clearTimeout(beepTimeout); beepTimeout = null; }
+}
+
+/**
+ * Given depth values, compute beep parameters and start/stop accordingly.
+ * depth > dangerThreshold → beep at rate proportional to max depth
+ */
+function updateBeep(left, center, right) {
+  const max = Math.max(left, center, right);
+
+  if (max <= dangerThreshold) {
+    stopBeeping();
+    return;
+  }
+
+  // Direction: pan to wherever the obstacle is
+  let pan  = 0;
+  let freq = 880;
+  if (left >= center && left >= right)        { pan = -1; freq = 660; }
+  else if (right >= center && right >= left)  { pan =  1; freq = 880; }
+  else                                        { pan =  0; freq = 770; }
+
+  // Beep interval: 700ms at threshold → 80ms at max (255)
+  // More danger = shorter gap = almost continuous beep
+  const ratio      = Math.min(1, (max - dangerThreshold) / (255 - dangerThreshold));
+  const intervalMs = Math.round(700 - ratio * 620); // 700 → 80ms
+
+  // Only restart if params changed significantly
+  if (!beepState.active ||
+      Math.abs(beepState.pan - pan) > 0.1 ||
+      Math.abs(beepState.intervalMs - intervalMs) > 40) {
+    startBeeping(pan, intervalMs, freq);
+  }
+}
+
+// ══════════════════════════════════════════════════════════════════════
+// TOGGLE BUTTONS
+// ══════════════════════════════════════════════════════════════════════
+function toggleAudio() {
+  audioEnabled = !audioEnabled;
+  if (audioEnabled) {
+    if (!audioCtx) initAudio();
+    else audioCtx.resume();
+    document.getElementById('audioDot').className = 'dot live';
+    document.getElementById('audioStatus').textContent = 'AUDIO ON';
+    document.getElementById('audioBtn').classList.add('active');
+    document.getElementById('audioBtn').textContent = '🔊 Audio ON';
+  } else {
+    stopBeeping();
+    document.getElementById('audioDot').className = 'dot';
+    document.getElementById('audioStatus').textContent = 'AUDIO OFF';
+    document.getElementById('audioBtn').classList.remove('active');
+    document.getElementById('audioBtn').textContent = '🔊 Enable Audio';
+  }
+}
+
+function toggleSpeech() {
+  speechEnabled = !speechEnabled;
+  const btn = document.getElementById('speechBtn');
+  btn.classList.toggle('active', speechEnabled);
+  btn.textContent = speechEnabled ? '🗣 Voice ON' : '🗣 Voice Alerts';
+  if (speechEnabled) speak('Voice alerts enabled');
+}
+
+function speak(text) {
+  if (!speechEnabled || !window.speechSynthesis) return;
+  const now = Date.now();
+  if (now - lastSpeechTime < 2800) return;
+  lastSpeechTime = now;
+  const u = new SpeechSynthesisUtterance(text);
+  u.rate = 1.15; u.pitch = 1;
+  window.speechSynthesis.speak(u);
+}
+
+function triggerHaptic(pattern = [100, 50, 100]) {
+  if (navigator.vibrate) navigator.vibrate(pattern);
+}
+
+function updateThreshold(val) {
+  dangerThreshold = parseInt(val);
+}
+
+// ══════════════════════════════════════════════════════════════════════
+// UI UPDATE
+// ══════════════════════════════════════════════════════════════════════
+function barClass(v) {
+  if (v > dangerThreshold) return 'zone-bar danger';
+  if (v > 100) return 'zone-bar warn';
+  return 'zone-bar safe';
+}
+function valClass(v) {
+  if (v > dangerThreshold) return 'zone-value danger';
+  if (v > 100) return 'zone-value warn';
+  return 'zone-value';
+}
+
+function updateZone(barId, valId, v) {
+  const pct = Math.min(100, (v / 255) * 100);
+  const bar = document.getElementById(barId);
+  const el  = document.getElementById(valId);
+  bar.style.width = pct + '%';
+  bar.className = barClass(v);
+  el.textContent = Math.round(v);
+  el.className = valClass(v);
+}
+
+function spawnBeepRing(cellId) {
+  const cell = document.getElementById(cellId);
+  const ring = document.createElement('div');
+  ring.className = 'beep-ring';
+  cell.appendChild(ring);
+  setTimeout(() => ring.remove(), 700);
+}
+
+function updateDirectionUI(left, center, right) {
+  const cells = [
+    { id: 'dirLeft',   statusId: 'dirLeftStatus',   val: left   },
+    { id: 'dirCenter', statusId: 'dirCenterStatus',  val: center },
+    { id: 'dirRight',  statusId: 'dirRightStatus',   val: right  },
+  ];
+
+  cells.forEach(({ id, statusId, val }) => {
+    const cell   = document.getElementById(id);
+    const status = document.getElementById(statusId);
+    if (val > dangerThreshold) {
+      cell.classList.add('beeping');
+      cell.classList.remove('warn-zone');
+      status.textContent = `DANGER ${Math.round(val)}`;
+      status.className = 'dir-status active';
+    } else if (val > 100) {
+      cell.classList.remove('beeping');
+      cell.classList.add('warn-zone');
+      status.textContent = `warn ${Math.round(val)}`;
+      status.className = 'dir-status';
+    } else {
+      cell.classList.remove('beeping', 'warn-zone');
+      status.textContent = 'clear';
+      status.className = 'dir-status';
+    }
+  });
+}
+
+let beepRingInterval = null;
+function manageBeepRingAnimation(left, center, right) {
+  const max = Math.max(left, center, right);
+  if (max > dangerThreshold) {
+    if (!beepRingInterval) {
+      beepRingInterval = setInterval(() => {
+        const vals = [
+          { id: 'dirLeft',   v: left   },
+          { id: 'dirCenter', v: center },
+          { id: 'dirRight',  v: right  },
+        ];
+        vals.forEach(({ id, v }) => { if (v > dangerThreshold) spawnBeepRing(id); });
+      }, beepState.intervalMs || 500);
+    }
+  } else {
+    if (beepRingInterval) { clearInterval(beepRingInterval); beepRingInterval = null; }
+  }
+}
+
+// ══════════════════════════════════════════════════════════════════════
+// MAIN POLL
+// ══════════════════════════════════════════════════════════════════════
+async function poll() {
+  try {
+    const res = await fetch('/data');
+    if (!res.ok) throw new Error();
+    const d = await res.json();
+
+    const { left, center, right, alert: isAlert, alert_direction: dir,
+            fps, stream_fps } = d;
+
+    updateZone('leftBar',   'leftVal',   left);
+    updateZone('centerBar', 'centerVal', center);
+    updateZone('rightBar',  'rightVal',  right);
+    updateDirectionUI(left, center, right);
+
+    // BEEP ENGINE
+    if (audioEnabled) updateBeep(left, center, right);
+    manageBeepRingAnimation(left, center, right);
+
+    // Stats
+    peakDepth = Math.max(peakDepth, left, center, right);
+    document.getElementById('statStreamFps').textContent = stream_fps || '--';
+    document.getElementById('statDepthFps').textContent  = fps || '--';
+    document.getElementById('statPeak').textContent = Math.round(peakDepth);
+    document.getElementById('fpsDisplay').textContent = (stream_fps || '--') + ' FPS';
+
+    // Beep status label
+    document.getElementById('beepStatus').textContent =
+      beepState.active ? `BEEPING ${beepState.intervalMs}ms` : 'SILENT';
+
+    // Alert box
+    const overlay  = document.getElementById('dangerOverlay');
+    const alertBox = document.getElementById('alertBox');
+    const alertTxt = document.getElementById('alertText');
+
+    if (isAlert) {
+      overlay.classList.add('danger');
+      alertBox.classList.add('active');
+      alertBox.querySelector('.alert-icon').textContent = '🚨';
+      alertTxt.textContent = `OBSTACLE ${dir} — depth ${Math.round(Math.max(left,center,right))}`;
+
+      const now = Date.now();
+      if (now - lastAlertTime > 2500) {
+        alertCount++;
+        document.getElementById('statAlerts').textContent = alertCount;
+        triggerHaptic([200, 100, 200]);
+        speak(`Warning! Obstacle ${dir.toLowerCase()}`);
+        lastAlertTime = now;
+      }
+    } else {
+      overlay.classList.remove('danger');
+      alertBox.classList.remove('active');
+      alertBox.querySelector('.alert-icon').textContent = '🟢';
+      alertTxt.textContent = 'All clear — path is safe';
+    }
+
+    document.getElementById('camDot').className = 'dot live';
+    document.getElementById('camStatus').textContent = 'LIVE';
+    document.getElementById('lastUpdate').textContent =
+      'UPDATED: ' + new Date().toLocaleTimeString();
+
+  } catch (e) {
+    document.getElementById('camDot').className = 'dot';
+    document.getElementById('camStatus').textContent = 'NO FEED';
+  }
+}
+
+// ══════════════════════════════════════════════════════════════════════
+// CAMERA SELECT
+// ══════════════════════════════════════════════════════════════════════
+async function loadCameras() {
+  try {
+    const res  = await fetch('/cameras');
+    const cams = await res.json();
+    const sel  = document.getElementById('cameraSelect');
+    cams.forEach(i => {
+      const opt = document.createElement('option');
+      opt.value = i; opt.text = `Camera ${i}`;
+      if (i === 1) opt.selected = true;
+      sel.appendChild(opt);
+    });
+  } catch(e) {}
+}
+
+document.getElementById('cameraSelect').onchange = async function() {
+  if (!this.value) return;
+  await fetch('/set_camera', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({ index: parseInt(this.value) })
+  });
+};
+
+// ══════════════════════════════════════════════════════════════════════
+// BOOT
+// ══════════════════════════════════════════════════════════════════════
+loadCameras();
+setInterval(poll, 150); // ~7 Hz data polling is enough; video streams independently
+</script>
+</body>
+</html>
