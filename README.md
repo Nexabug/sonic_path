@@ -1,30 +1,52 @@
 # Sonic Path
 
-Sonic Path is a Flask-based computer vision prototype that turns a live camera feed into depth-aware obstacle guidance. It uses MiDaS depth estimation, divides the scene into left, center, and right zones, and exposes real-time data for a frontend that can drive visual, audio, or haptic alerts.
+Sonic Path now supports two modes:
 
-## Features
+- GitHub Pages mode: a shareable browser app in [`index.html`](./index.html)
+- Local Flask prototype: the original Python + MiDaS experiment in [`app.py`](./app.py)
 
-- Live camera capture with threaded frame reading
-- MiDaS depth inference with OpenCV overlay rendering
-- Left, center, and right obstacle zone analysis
-- MJPEG video stream for the live depth view
-- JSON endpoints for status, camera switching, and telemetry
-- Frontend-ready alert data for spatial audio or assistive UI
+## Shareable Link
 
-## Tech Stack
+After GitHub Pages deploys, use:
 
-- Python
+```text
+https://nexabug.github.io/sonic_path/
+```
+
+This version works in the browser and asks the user for camera permission directly on their own device.
+
+## What Runs on GitHub Pages
+
+The Pages version is fully static and uses:
+
+- TensorFlow.js
+- Coco-SSD object detection
+- Browser camera access with `getUserMedia`
+- Client-side audio beeps and optional voice alerts
+
+Instead of Flask/OpenCV depth inference, the shared web version estimates obstacle risk from:
+
+- object position: left, center, or right
+- object size in frame: bigger usually means closer
+
+That makes it suitable for demos and link sharing.
+
+## How To Use The Shared App
+
+1. Open the GitHub Pages link.
+2. Tap `Start Camera`.
+3. Allow camera permission.
+4. Optionally enable audio and voice alerts.
+5. Point the camera toward nearby people or objects to trigger warnings.
+
+## Local Flask Prototype
+
+The repo still includes the original local prototype in [`app.py`](./app.py), which uses:
+
 - Flask
 - OpenCV
 - PyTorch
-- MiDaS
-- NumPy
-
-## Requirements
-
-- Python 3.10+ recommended
-- A connected webcam or USB camera
-- Internet access on first run so `torch.hub` can fetch MiDaS assets
+- MiDaS depth estimation
 
 Install dependencies:
 
@@ -32,9 +54,7 @@ Install dependencies:
 pip install -r requirements.txt
 ```
 
-## Run Locally
-
-Start the app:
+Run locally:
 
 ```bash
 python app.py
@@ -46,36 +66,15 @@ Then open:
 http://localhost:5000
 ```
 
-## API Endpoints
+## GitHub Pages Deployment
 
-- `/` - main UI
-- `/video` - MJPEG video stream
-- `/data` - latest depth and alert data as JSON
-- `/cameras` - detected camera indices
-- `/set_camera` - switch active camera via `POST`
-- `/health` - health/status payload
+This repo includes:
 
-Example camera switch request:
+- [`.github/workflows/deploy-pages.yml`](./.github/workflows/deploy-pages.yml) for Pages deployment
+- [`.nojekyll`](./.nojekyll) to avoid Jekyll processing issues
 
-```bash
-curl -X POST http://localhost:5000/set_camera ^
-  -H "Content-Type: application/json" ^
-  -d "{\"index\":0}"
-```
+Pushing to `main` triggers a new Pages deployment.
 
-## Notes
+## Important Note
 
-- The default camera index is currently set in `app.py`.
-- The app starts background threads immediately on startup.
-- MiDaS model loading can take a little time on the first launch.
-- GPU is used automatically when CUDA is available; otherwise it runs on CPU.
-
-## Project Files
-
-- `app.py` - Flask server, camera pipeline, MiDaS inference, and API routes
-- `index.html` - frontend UI for the live feed and alerts
-- `requirements.txt` - Python dependencies
-
-## Hackathon Context
-
-This project is designed as an assistive navigation prototype for visually impaired users, combining depth perception with directional feedback concepts such as beeps, voice alerts, and haptics.
+The GitHub Pages version is a browser-first approximation for demo sharing. It does not run the Python MiDaS pipeline in the cloud. Instead, it uses client-side object detection so the shared link works on phones and laptops without a backend.
