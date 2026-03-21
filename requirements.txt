@@ -1,9 +1,0 @@
-flask>=3.0
-flask-cors>=4.0
-opencv-python>=4.9
-torch>=2.2
-torchvision>=0.17
-numpy>=1.26
-timm>=0.9        # required by MiDaS
-# Optional — uncomment to enable real-time object detection:
-# ultralytics>=8.2
