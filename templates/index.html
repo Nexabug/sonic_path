@@ -4,45 +4,77 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>VisionSound — AI Depth Assist</title>
-<link href="https://fonts.googleapis.com/css2?family=Space+Mono:wght@400;700&family=Syne:wght@400;700;800&display=swap" rel="stylesheet">
+<link href="https://fonts.googleapis.com/css2?family=Roboto:wght@400;500;700;900&display=swap" rel="stylesheet">
 <style>
   :root {
-    --bg: #050a0e; --surface: #0d1f2d; --surface2: #112233;
-    --accent: #00ffc3; --accent2: #00aaff; --warn: #ffaa00; --danger: #ff3b3b;
-    --text: #cde8f0; --muted: #4a7a90; --border: rgba(0,255,195,0.15);
-    --font-display: 'Syne', sans-serif; --font-mono: 'Space Mono', monospace;
+    --bg: #0f172a; --surface: #1e293b; --surface2: #263348;
+    --accent: #2563EB; --accent2: #3b82f6; --warn: #f59e0b; --danger: #ef4444;
+    --text: #ffffff; --muted: #94a3b8; --border: rgba(37,99,235,0.25);
+    --font-display: 'Roboto', sans-serif; --font-mono: 'Roboto', sans-serif;
   }
   * { margin:0; padding:0; box-sizing:border-box; }
-  body { background:var(--bg); color:var(--text); font-family:var(--font-mono); min-height:100vh; overflow-x:hidden; }
+  body { background:var(--bg); color:var(--text); font-family:'Roboto', sans-serif; min-height:100vh; overflow-x:hidden; }
   body::before {
     content:''; position:fixed; inset:0; pointer-events:none; z-index:0;
-    background-image: linear-gradient(rgba(0,255,195,0.03) 1px,transparent 1px),
-                      linear-gradient(90deg,rgba(0,255,195,0.03) 1px,transparent 1px);
+    background-image: linear-gradient(rgba(37,99,235,0.04) 1px,transparent 1px),
+                      linear-gradient(90deg,rgba(37,99,235,0.04) 1px,transparent 1px);
     background-size:40px 40px;
   }
   .wrapper { position:relative; z-index:1; max-width:1200px; margin:0 auto; padding:24px; }
 
   header { display:flex; align-items:center; justify-content:space-between; border-bottom:1px solid var(--border); padding-bottom:18px; margin-bottom:24px; }
   .logo { display:flex; align-items:center; gap:14px; }
-  .logo-icon { width:44px; height:44px; border-radius:10px; background:linear-gradient(135deg,var(--accent),var(--accent2)); display:flex; align-items:center; justify-content:center; font-size:22px; box-shadow:0 0 20px rgba(0,255,195,0.3); }
-  h1 { font-family:var(--font-display); font-size:26px; font-weight:800; background:linear-gradient(90deg,var(--accent),var(--accent2)); -webkit-background-clip:text; -webkit-text-fill-color:transparent; }
+  .logo-icon { width:44px; height:44px; border-radius:10px; background:linear-gradient(135deg,var(--accent),var(--accent2)); display:flex; align-items:center; justify-content:center; font-size:22px; box-shadow:0 0 20px rgba(37,99,235,0.4); }
+  h1 { font-family:'Roboto', sans-serif; font-size:26px; font-weight:900; background:linear-gradient(90deg,#ffffff,var(--accent2)); -webkit-background-clip:text; -webkit-text-fill-color:transparent; }
   .tagline { font-size:10px; color:var(--muted); letter-spacing:2px; text-transform:uppercase; margin-top:2px; }
 
   .status-bar { display:flex; gap:20px; }
   .status-pill { display:flex; align-items:center; gap:7px; font-size:11px; color:var(--muted); letter-spacing:1px; text-transform:uppercase; }
   .dot { width:8px; height:8px; border-radius:50%; background:var(--muted); transition:all 0.3s; }
-  .dot.live { background:var(--accent); box-shadow:0 0 8px var(--accent); animation:pulse-dot 1.5s infinite; }
+  .dot.live { background:#22c55e; box-shadow:0 0 8px #22c55e; animation:pulse-dot 1.5s infinite; }
   @keyframes pulse-dot { 0%,100%{opacity:1;transform:scale(1)} 50%{opacity:0.5;transform:scale(0.8)} }
 
-  .controls { display:flex; gap:16px; margin-bottom:22px; flex-wrap:wrap; align-items:center; }
+  .controls { display:flex; gap:16px; margin-bottom:22px; flex-wrap:wrap; align-items:center; justify-content: space-between; }
   .dir-icon svg { width:22px; height:22px; display:block; margin:0 auto; }
   .select-wrap { position:relative; }
-  select { appearance:none; background:var(--surface); border:1px solid var(--border); color:var(--text); padding:9px 34px 9px 14px; border-radius:8px; font-family:var(--font-mono); font-size:12px; cursor:pointer; outline:none; transition:border-color 0.2s; }
+  select { appearance:none; background:var(--surface); border:1px solid var(--border); color:#ffffff; padding:9px 34px 9px 14px; border-radius:8px; font-family:'Roboto', sans-serif; font-size:12px; cursor:pointer; outline:none; transition:border-color 0.2s; }
   select:hover,select:focus { border-color:var(--accent); }
   .select-arrow { position:absolute; right:10px; top:50%; transform:translateY(-50%); color:var(--muted); pointer-events:none; font-size:10px; }
-  .btn { padding:9px 18px; border-radius:8px; border:1px solid var(--border); background:var(--surface); color:var(--accent); font-family:var(--font-mono); font-size:12px; cursor:pointer; transition:all 0.2s; display:flex; align-items:center; gap:7px; }
-  .btn:hover { background:rgba(0,255,195,0.08); border-color:var(--accent); }
-  .btn.active { background:rgba(0,255,195,0.15); border-color:var(--accent); }
+
+  /* TOGGLE SWITCH BUTTON */
+  .btn {
+    display:flex; align-items:center; gap:10px;
+    padding:8px 14px; border-radius:8px; border:1px solid var(--border);
+    background:var(--surface); color:#ffffff;
+    font-family:'Roboto', sans-serif; font-size:12px; font-weight:500;
+    cursor:pointer; transition:all 0.2s;
+  }
+  .btn:hover { border-color:var(--accent); background:rgba(37,99,235,0.1); }
+  .btn.active { background:rgba(37,99,235,0.15); border-color:var(--accent); }
+
+  /* The toggle track */
+  .toggle-track {
+    position:relative; width:38px; height:20px; border-radius:10px;
+    background:#374151; border:2px solid #4b5563;
+    transition:background 0.25s, border-color 0.25s; flex-shrink:0;
+  }
+  .btn.active .toggle-track {
+    background:var(--accent); border-color:var(--accent2);
+  }
+  /* The toggle knob */
+  .toggle-knob {
+    position:absolute; top:2px; left:2px;
+    width:12px; height:12px; border-radius:50%;
+    background:#ffffff; transition:transform 0.25s cubic-bezier(0.4,0,0.2,1);
+    box-shadow:0 1px 4px rgba(0,0,0,0.4);
+  }
+  .btn.active .toggle-knob { transform:translateX(18px); }
+  /* ON/OFF label beside icon */
+  .toggle-state {
+    font-size:10px; font-weight:700; letter-spacing:1px;
+    color:var(--muted); transition:color 0.2s;
+  }
+  .btn.active .toggle-state { color:#ffffff; }
 
   .main-grid { display:grid; grid-template-columns:1fr 360px; gap:18px; margin-bottom:18px; }
 
@@ -65,10 +97,10 @@
   .zone-label { font-size:10px; letter-spacing:2px; text-transform:uppercase; color:var(--muted); }
   .zone-bar-wrap { height:10px; background:rgba(255,255,255,0.05); border-radius:5px; overflow:hidden; }
   .zone-bar { height:100%; border-radius:5px; transition:width 0.25s cubic-bezier(0.4,0,0.2,1), background 0.25s; }
-  .zone-bar.safe   { background:linear-gradient(90deg,#00ffc3,#00e0aa); }
-  .zone-bar.warn   { background:linear-gradient(90deg,#ffaa00,#ff8800); }
-  .zone-bar.danger { background:linear-gradient(90deg,#ff3b3b,#cc0000); }
-  .zone-value { font-size:15px; font-weight:700; text-align:right; color:var(--accent); transition:color 0.25s; }
+  .zone-bar.safe   { background:linear-gradient(90deg,#2563EB,#3b82f6); }
+  .zone-bar.warn   { background:linear-gradient(90deg,#f59e0b,#fb923c); }
+  .zone-bar.danger { background:linear-gradient(90deg,#ef4444,#b91c1c); }
+  .zone-value { font-size:15px; font-weight:700; text-align:right; color:#ffffff; transition:color 0.25s; }
   .zone-value.warn   { color:var(--warn); }
   .zone-value.danger { color:var(--danger); }
 
@@ -113,7 +145,7 @@
   /* STATS */
   .stats-row { display:grid; grid-template-columns:repeat(4,1fr); gap:12px; margin-bottom:18px; }
   .stat-cell { background:var(--surface); border:1px solid var(--border); border-radius:12px; padding:14px; text-align:center; }
-  .stat-value { font-size:26px; font-weight:700; font-family:var(--font-display); color:var(--accent); line-height:1; }
+  .stat-value { font-size:26px; font-weight:700; font-family:'Roboto', sans-serif; color:#ffffff; line-height:1; }
   .stat-label { font-size:9px; color:var(--muted); letter-spacing:2px; text-transform:uppercase; margin-top:5px; }
 
   footer { border-top:1px solid var(--border); padding-top:14px; display:flex; justify-content:space-between; font-size:10px; color:var(--muted); letter-spacing:1px; }
@@ -146,9 +178,9 @@
       <select id="cameraSelect"><option value="">— Camera —</option></select>
       <span class="select-arrow">▼</span>
     </div>
-    <button class="btn" id="audioBtn" onclick="toggleAudio()">🔊 Enable Audio</button>
-    <button class="btn" id="speechBtn" onclick="toggleSpeech()">🗣 Voice Alerts</button>
-    <button class="btn" onclick="triggerHaptic([100,50,100])">📳 Test Haptic</button>
+    <button class="btn" id="audioBtn" onclick="toggleAudio()">Audio <div class="toggle-track"><div class="toggle-knob"></div></div><span class="toggle-state">OFF</span></button>
+    <button class="btn" id="speechBtn" onclick="toggleSpeech()">Voice Alerts <div class="toggle-track"><div class="toggle-knob"></div></div><span class="toggle-state">OFF</span></button>
+    <button class="btn" onclick="triggerHaptic([100,50,100])">Test Haptic</button>
     <div class="select-wrap">
       <select id="sensSelect" onchange="updateThreshold(this.value)">
         <option value="180">Low Sensitivity</option>
@@ -379,14 +411,16 @@ function toggleAudio() {
     else audioCtx.resume();
     document.getElementById('audioDot').className = 'dot live';
     document.getElementById('audioStatus').textContent = 'AUDIO ON';
-    document.getElementById('audioBtn').classList.add('active');
-    document.getElementById('audioBtn').textContent = '🔊 Audio ON';
+    const btn = document.getElementById('audioBtn');
+    btn.classList.add('active');
+    btn.querySelector('.toggle-state').textContent = 'ON';
   } else {
     stopBeeping();
     document.getElementById('audioDot').className = 'dot';
     document.getElementById('audioStatus').textContent = 'AUDIO OFF';
-    document.getElementById('audioBtn').classList.remove('active');
-    document.getElementById('audioBtn').textContent = '🔊 Enable Audio';
+    const btn = document.getElementById('audioBtn');
+    btn.classList.remove('active');
+    btn.querySelector('.toggle-state').textContent = 'OFF';
   }
 }
 
@@ -394,7 +428,7 @@ function toggleSpeech() {
   speechEnabled = !speechEnabled;
   const btn = document.getElementById('speechBtn');
   btn.classList.toggle('active', speechEnabled);
-  btn.textContent = speechEnabled ? '🗣 Voice ON' : '🗣 Voice Alerts';
+  btn.querySelector('.toggle-state').textContent = speechEnabled ? 'ON' : 'OFF';
   if (speechEnabled) speak('Voice alerts enabled');
 }
 
