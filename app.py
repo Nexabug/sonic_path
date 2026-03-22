@@ -3,6 +3,7 @@ VisionSound — AI Depth & Spatial Audio Assist
 Two-thread architecture:
   Thread 1: reads raw camera frames as fast as possible (30+ FPS)
   Thread 2: runs MiDaS depth inference (~5-15 FPS on CPU)
+  Thread 3: voice TTS alert thread (non-blocking, debounced)
   MJPEG stream: overlays latest depth result onto latest raw frame → smooth video
 """
 
@@ -13,7 +14,16 @@ import torch
 import numpy as np
 import threading
 import time
+import queue
 import logging
+
+# ── OPTIONAL: pyttsx3 for offline TTS ────────────────────────────────
+try:
+    import pyttsx3
+    TTS_AVAILABLE = True
+except ImportError:
+    TTS_AVAILABLE = False
+    logging.warning("pyttsx3 not found — install with: pip install pyttsx3")
 
 # ── CONFIG ────────────────────────────────────────────────────────────
 CAMERA_INDEX     = 1       # USB camera index
@@ -24,6 +34,12 @@ STREAM_HEIGHT    = 480
 INFER_WIDTH      = 256     # resize to this before MiDaS (much faster)
 INFER_HEIGHT     = 192
 JPEG_QUALITY     = 75
+
+# ── VOICE CONFIG ──────────────────────────────────────────────────────
+VOICE_ENABLED        = True          # master switch
+VOICE_COOLDOWN_SEC   = 3.0           # minimum seconds between voice alerts
+VOICE_RATE           = 160           # words-per-minute (pyttsx3)
+VOICE_VOLUME         = 1.0           # 0.0 – 1.0
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(message)s')
 log = logging.getLogger(__name__)
@@ -39,10 +55,15 @@ raw_frame   = None   # latest BGR frame from camera (numpy)
 depth_frame = None   # latest coloured depth overlay (numpy)
 latest_data = {"left": 0.0, "center": 0.0, "right": 0.0,
                "alert": False, "alert_direction": "", "fps": 0.0,
-               "stream_fps": 0.0}
+               "stream_fps": 0.0, "voice_enabled": VOICE_ENABLED}
 running     = True
 cap         = None
 cam_lock    = threading.Lock()
+
+# ── VOICE ALERT STATE ─────────────────────────────────────────────────
+speech_queue      = queue.Queue(maxsize=1)   # only keep the latest message
+last_spoken_time  = 0.0
+voice_lock        = threading.Lock()
 
 # ── MODEL ─────────────────────────────────────────────────────────────
 log.info("Loading MiDaS small …")
@@ -54,6 +75,100 @@ if device == "cuda":
 _t     = torch.hub.load("intel-isl/MiDaS", "transforms", trust_repo=True)
 midas_transform = _t.small_transform
 log.info(f"MiDaS ready on {device}")
+
+# ── HELPERS ───────────────────────────────────────────────────────────
+def depth_to_distance_label(value: float) -> str:
+    """
+    Converts a depth map value (0–255) to a human-readable distance label.
+    Higher MiDaS values = closer object (inverse depth).
+    """
+    if value >= 220:
+        return "extremely close"
+    elif value >= 180:
+        return "very close"
+    elif value >= DANGER_THRESHOLD:
+        return "close"
+    elif value >= WARN_THRESHOLD:
+        return "at medium distance"
+    else:
+        return "far away"
+
+def build_voice_message(left: float, center: float, right: float,
+                         direction: str, max_val: float) -> str:
+    """Build a natural-language voice alert string."""
+    label = depth_to_distance_label(max_val)
+
+    if direction == "CENTER":
+        return f"Warning! Obstacle directly ahead, {label}."
+    elif direction == "LEFT":
+        return f"Warning! Obstacle on your left, {label}."
+    elif direction == "RIGHT":
+        return f"Warning! Obstacle on your right, {label}."
+    else:
+        return f"Warning! Obstacle detected, {label}."
+
+# ── THREAD 3: VOICE / TTS ─────────────────────────────────────────────
+def voice_thread():
+    """
+    Dedicated thread that drains speech_queue and speaks via pyttsx3.
+    pyttsx3 is NOT thread-safe — must be created inside this thread.
+    """
+    if not TTS_AVAILABLE:
+        log.warning("Voice thread exiting — pyttsx3 not installed.")
+        return
+
+    engine = pyttsx3.init()
+    engine.setProperty("rate",   VOICE_RATE)
+    engine.setProperty("volume", VOICE_VOLUME)
+
+    # Pick a clear female/male voice if available
+    voices = engine.getProperty("voices")
+    for v in voices:
+        if "english" in v.name.lower() or "zira" in v.name.lower() \
+                or "david" in v.name.lower():
+            engine.setProperty("voice", v.id)
+            break
+
+    log.info("Voice thread ready.")
+
+    while running:
+        try:
+            message = speech_queue.get(timeout=0.5)
+            if message is None:            # shutdown sentinel
+                break
+            log.info(f"[VOICE] → {message}")
+            engine.say(message)
+            engine.runAndWait()
+        except queue.Empty:
+            continue
+        except Exception as e:
+            log.error(f"TTS error: {e}")
+
+def enqueue_voice(message: str):
+    """
+    Thread-safe: push a message only if cooldown has passed.
+    Drops old pending message and replaces with newer one (maxsize=1).
+    """
+    global last_spoken_time
+
+    if not VOICE_ENABLED or not TTS_AVAILABLE:
+        return
+
+    now = time.time()
+    with voice_lock:
+        if now - last_spoken_time < VOICE_COOLDOWN_SEC:
+            return                         # still in cooldown, skip
+        last_spoken_time = now
+
+    # Drain stale entry (if any) and push new message
+    try:
+        speech_queue.get_nowait()
+    except queue.Empty:
+        pass
+    try:
+        speech_queue.put_nowait(message)
+    except queue.Full:
+        pass                               # already has one pending
 
 # ── CAMERA ────────────────────────────────────────────────────────────
 def open_camera(index: int):
@@ -180,6 +295,11 @@ def inference_thread():
             else:
                 direction = "CENTER"
 
+            # ── VOICE ALERT ───────────────────────────────────────────
+            msg = build_voice_message(left, center, right, direction, max_val)
+            enqueue_voice(msg)
+            # ─────────────────────────────────────────────────────────
+
         fps_count += 1
         now = time.time()
         if now - fps_time >= 1.0:
@@ -202,10 +322,16 @@ def inference_thread():
         cc = (60, 60, 255) if center > DANGER_THRESHOLD else (80, 220, 80)
         rc = (60, 60, 255) if right  > DANGER_THRESHOLD else (80, 220, 80)
 
-        put(f"L:{left:.0f}",   8,  30, lc)
-        put(f"C:{center:.0f}", w // 2 - 28, 30, cc)
-        put(f"R:{right:.0f}",  2 * w // 3 + 8, 30, rc)
+        # Distance label on each zone
+        put(f"L:{left:.0f} ({depth_to_distance_label(left)})",   8,  30, lc)
+        put(f"C:{center:.0f} ({depth_to_distance_label(center)})", w // 2 - 70, 30, cc)
+        put(f"R:{right:.0f} ({depth_to_distance_label(right)})",  2 * w // 3 + 8, 30, rc)
         put(f"DEPTH {ifps:.0f}fps", w - 105, h - 10, (180, 180, 180))
+
+        # Voice indicator badge
+        v_col  = (0, 220, 80) if VOICE_ENABLED else (100, 100, 100)
+        v_text = "VOICE ON" if VOICE_ENABLED else "VOICE OFF"
+        put(v_text, 8, h - 10, v_col)
 
         if is_danger:
             cv2.rectangle(coloured, (0, 0), (w, h), (0, 0, 255), 4)
@@ -220,6 +346,8 @@ def inference_thread():
                 "alert":           is_danger,
                 "alert_direction": direction,
                 "fps":             round(ifps, 1),
+                "voice_enabled":   VOICE_ENABLED,
+                "distance_label":  depth_to_distance_label(max_val) if is_danger else "",
             })
 
 # ── MJPEG GENERATOR ───────────────────────────────────────────────────
@@ -276,11 +404,37 @@ def set_camera():
     except Exception as e:
         return jsonify({"status": "error", "message": str(e)}), 500
 
+@app.route("/toggle_voice", methods=["POST"])
+def toggle_voice():
+    """Enable or disable voice alerts at runtime."""
+    global VOICE_ENABLED
+    body = request.get_json(silent=True) or {}
+    if "enabled" in body:
+        VOICE_ENABLED = bool(body["enabled"])
+    else:
+        VOICE_ENABLED = not VOICE_ENABLED          # simple toggle
+    with depth_lock:
+        latest_data["voice_enabled"] = VOICE_ENABLED
+    log.info(f"Voice alerts {'ENABLED' if VOICE_ENABLED else 'DISABLED'}")
+    return jsonify({"status": "ok", "voice_enabled": VOICE_ENABLED})
+
+@app.route("/set_voice_cooldown", methods=["POST"])
+def set_voice_cooldown():
+    """Change how often voice speaks (seconds between alerts)."""
+    global VOICE_COOLDOWN_SEC
+    try:
+        val = float(request.json["cooldown"])
+        VOICE_COOLDOWN_SEC = max(0.5, min(val, 30.0))
+        return jsonify({"status": "ok", "cooldown": VOICE_COOLDOWN_SEC})
+    except Exception as e:
+        return jsonify({"status": "error", "message": str(e)}), 400
+
 @app.route("/health")
 def health():
     with depth_lock:
         d = dict(latest_data)
-    return jsonify({"status": "ok", "device": device, **d})
+    return jsonify({"status": "ok", "device": device,
+                    "tts_available": TTS_AVAILABLE, **d})
 
 # ── STARTUP ───────────────────────────────────────────────────────────
 def startup():
@@ -293,6 +447,7 @@ def startup():
 
     threading.Thread(target=camera_thread,    daemon=True, name="CamReader").start()
     threading.Thread(target=inference_thread, daemon=True, name="DepthInfer").start()
+    threading.Thread(target=voice_thread,     daemon=True, name="VoiceTTS").start()
     log.info("All threads started — visit http://localhost:5000")
 
 startup()
@@ -303,5 +458,6 @@ if __name__ == "__main__":
                 debug=False, threaded=True, use_reloader=False)
     finally:
         running = False
+        speech_queue.put_nowait(None)   # graceful shutdown sentinel for TTS
         if cap:
             cap.release()
