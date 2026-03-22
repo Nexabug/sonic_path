@@ -41,6 +41,14 @@ VOICE_COOLDOWN_SEC   = 3.0           # minimum seconds between voice alerts
 VOICE_RATE           = 160           # words-per-minute (pyttsx3)
 VOICE_VOLUME         = 1.0           # 0.0 – 1.0
 
+# ── HAPTIC CONFIG ─────────────────────────────────────────────────────
+HAPTIC_ENABLED         = True   # master switch (synced with frontend toggle)
+HAPTIC_PULSE_MIN_MS    = 40     # vibration duration (ms) at danger threshold
+HAPTIC_PULSE_MAX_MS    = 220    # vibration duration (ms) at max depth (255)
+HAPTIC_INTERVAL_MIN_MS = 80     # fastest repeat interval (ms) — very close
+HAPTIC_INTERVAL_MAX_MS = 700    # slowest repeat interval (ms) — just past threshold
+HAPTIC_GAP_MS          = 60     # silence gap between pulses in a burst
+
 logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(message)s')
 log = logging.getLogger(__name__)
 
@@ -55,7 +63,9 @@ raw_frame   = None   # latest BGR frame from camera (numpy)
 depth_frame = None   # latest coloured depth overlay (numpy)
 latest_data = {"left": 0.0, "center": 0.0, "right": 0.0,
                "alert": False, "alert_direction": "", "fps": 0.0,
-               "stream_fps": 0.0, "voice_enabled": VOICE_ENABLED}
+               "stream_fps": 0.0, "voice_enabled": VOICE_ENABLED,
+               "haptic_enabled": HAPTIC_ENABLED,
+               "haptic_pattern": [], "haptic_interval_ms": 0}
 running     = True
 cap         = None
 cam_lock    = threading.Lock()
@@ -106,6 +116,38 @@ def build_voice_message(left: float, center: float, right: float,
         return f"Warning! Obstacle on your right, {label}."
     else:
         return f"Warning! Obstacle detected, {label}."
+
+# ── HAPTIC HELPERS ────────────────────────────────────────────────────
+def compute_haptic_params(max_val: float) -> tuple[int, int]:
+    """
+    Given the peak depth value (0–255), return (pulse_duration_ms, interval_ms).
+    Both scale linearly between threshold and 255:
+      pulse_duration: HAPTIC_PULSE_MIN_MS → HAPTIC_PULSE_MAX_MS  (longer = closer)
+      interval:       HAPTIC_INTERVAL_MAX_MS → HAPTIC_INTERVAL_MIN_MS (faster = closer)
+    Returns (0, 0) if below danger threshold.
+    """
+    if max_val <= DANGER_THRESHOLD:
+        return 0, 0
+    ratio        = min(1.0, (max_val - DANGER_THRESHOLD) / (255 - DANGER_THRESHOLD))
+    pulse_dur    = int(HAPTIC_PULSE_MIN_MS    + ratio * (HAPTIC_PULSE_MAX_MS    - HAPTIC_PULSE_MIN_MS))
+    interval_ms  = int(HAPTIC_INTERVAL_MAX_MS - ratio * (HAPTIC_INTERVAL_MAX_MS - HAPTIC_INTERVAL_MIN_MS))
+    return pulse_dur, interval_ms
+
+def build_haptic_pattern(direction: str, pulse_dur: int) -> list[int]:
+    """
+    Encode obstacle direction as a W3C Vibration API pattern (list of ints).
+    The frontend passes this directly to navigator.vibrate().
+      LEFT   → double pulse  [dur, gap, dur]
+      CENTER → single pulse  [dur]
+      RIGHT  → triple pulse  [dur, gap, dur, gap, dur]
+    Gap scales with pulse_dur so the pattern feels proportional.
+    """
+    gap = max(30, pulse_dur // 2)
+    if direction == "LEFT":
+        return [pulse_dur, gap, pulse_dur]
+    if direction == "RIGHT":
+        return [pulse_dur, gap, pulse_dur, gap, pulse_dur]
+    return [pulse_dur]   # CENTER — single decisive buzz
 
 # ── THREAD 3: VOICE / TTS ─────────────────────────────────────────────
 def voice_thread():
@@ -300,6 +342,10 @@ def inference_thread():
             enqueue_voice(msg)
             # ─────────────────────────────────────────────────────────
 
+        # ── HAPTIC DATA (computed every frame, sent to frontend) ──────
+        pulse_dur, haptic_interval = compute_haptic_params(max_val)
+        haptic_pat = build_haptic_pattern(direction, pulse_dur) if is_danger else []
+
         fps_count += 1
         now = time.time()
         if now - fps_time >= 1.0:
@@ -328,10 +374,16 @@ def inference_thread():
         put(f"R:{right:.0f} ({depth_to_distance_label(right)})",  2 * w // 3 + 8, 30, rc)
         put(f"DEPTH {ifps:.0f}fps", w - 105, h - 10, (180, 180, 180))
 
-        # Voice indicator badge
-        v_col  = (0, 220, 80) if VOICE_ENABLED else (100, 100, 100)
-        v_text = "VOICE ON" if VOICE_ENABLED else "VOICE OFF"
-        put(v_text, 8, h - 10, v_col)
+        # Status badges bottom-left: VOICE | HAPTIC
+        v_col  = (0, 220, 80) if VOICE_ENABLED  else (100, 100, 100)
+        h_col  = (0, 180, 255) if HAPTIC_ENABLED else (100, 100, 100)
+        put("VOICE ON"  if VOICE_ENABLED  else "VOICE OFF",  8, h - 25, v_col)
+        put("HAPTIC ON" if HAPTIC_ENABLED else "HAPTIC OFF", 8, h - 10, h_col)
+
+        # Haptic intensity badge when actively vibrating
+        if is_danger and HAPTIC_ENABLED:
+            ratio_pct = int(min(100, (max_val - DANGER_THRESHOLD) / (255 - DANGER_THRESHOLD) * 100))
+            put(f"VIBRATE {ratio_pct}%  {haptic_interval}ms", w // 2 - 70, h - 10, (0, 180, 255))
 
         if is_danger:
             cv2.rectangle(coloured, (0, 0), (w, h), (0, 0, 255), 4)
@@ -340,14 +392,17 @@ def inference_thread():
         with depth_lock:
             depth_frame = coloured
             latest_data.update({
-                "left":            round(left,   1),
-                "center":          round(center, 1),
-                "right":           round(right,  1),
-                "alert":           is_danger,
-                "alert_direction": direction,
-                "fps":             round(ifps, 1),
-                "voice_enabled":   VOICE_ENABLED,
-                "distance_label":  depth_to_distance_label(max_val) if is_danger else "",
+                "left":               round(left,   1),
+                "center":             round(center, 1),
+                "right":              round(right,  1),
+                "alert":              is_danger,
+                "alert_direction":    direction,
+                "fps":                round(ifps, 1),
+                "voice_enabled":      VOICE_ENABLED,
+                "haptic_enabled":     HAPTIC_ENABLED,
+                "haptic_pattern":     haptic_pat,        # e.g. [120, 60, 120]
+                "haptic_interval_ms": haptic_interval,   # e.g. 350
+                "distance_label":     depth_to_distance_label(max_val) if is_danger else "",
             })
 
 # ── MJPEG GENERATOR ───────────────────────────────────────────────────
@@ -418,6 +473,49 @@ def toggle_voice():
     log.info(f"Voice alerts {'ENABLED' if VOICE_ENABLED else 'DISABLED'}")
     return jsonify({"status": "ok", "voice_enabled": VOICE_ENABLED})
 
+@app.route("/toggle_haptic", methods=["POST"])
+def toggle_haptic():
+    """Enable or disable haptic feedback at runtime (mirrors /toggle_voice)."""
+    global HAPTIC_ENABLED
+    body = request.get_json(silent=True) or {}
+    if "enabled" in body:
+        HAPTIC_ENABLED = bool(body["enabled"])
+    else:
+        HAPTIC_ENABLED = not HAPTIC_ENABLED
+    with depth_lock:
+        latest_data["haptic_enabled"] = HAPTIC_ENABLED
+    log.info(f"Haptic feedback {'ENABLED' if HAPTIC_ENABLED else 'DISABLED'}")
+    return jsonify({"status": "ok", "haptic_enabled": HAPTIC_ENABLED})
+
+@app.route("/set_haptic_thresholds", methods=["POST"])
+def set_haptic_thresholds():
+    """
+    Tune haptic intensity at runtime.
+    Body (all optional):
+      pulse_min_ms    — vibration duration at danger threshold (default 40)
+      pulse_max_ms    — vibration duration at max depth        (default 220)
+      interval_min_ms — fastest repeat interval, very close   (default 80)
+      interval_max_ms — slowest repeat interval, at threshold (default 700)
+      gap_ms          — silence gap between directional pulses (default 60)
+    """
+    global HAPTIC_PULSE_MIN_MS, HAPTIC_PULSE_MAX_MS
+    global HAPTIC_INTERVAL_MIN_MS, HAPTIC_INTERVAL_MAX_MS, HAPTIC_GAP_MS
+    try:
+        body = request.get_json(silent=True) or {}
+        if "pulse_min_ms"    in body: HAPTIC_PULSE_MIN_MS    = max(10,  int(body["pulse_min_ms"]))
+        if "pulse_max_ms"    in body: HAPTIC_PULSE_MAX_MS    = max(50,  int(body["pulse_max_ms"]))
+        if "interval_min_ms" in body: HAPTIC_INTERVAL_MIN_MS = max(50,  int(body["interval_min_ms"]))
+        if "interval_max_ms" in body: HAPTIC_INTERVAL_MAX_MS = max(200, int(body["interval_max_ms"]))
+        if "gap_ms"          in body: HAPTIC_GAP_MS          = max(20,  int(body["gap_ms"]))
+        return jsonify({"status": "ok",
+                        "pulse_min_ms":    HAPTIC_PULSE_MIN_MS,
+                        "pulse_max_ms":    HAPTIC_PULSE_MAX_MS,
+                        "interval_min_ms": HAPTIC_INTERVAL_MIN_MS,
+                        "interval_max_ms": HAPTIC_INTERVAL_MAX_MS,
+                        "gap_ms":          HAPTIC_GAP_MS})
+    except Exception as e:
+        return jsonify({"status": "error", "message": str(e)}), 400
+
 @app.route("/set_voice_cooldown", methods=["POST"])
 def set_voice_cooldown():
     """Change how often voice speaks (seconds between alerts)."""
@@ -434,7 +532,12 @@ def health():
     with depth_lock:
         d = dict(latest_data)
     return jsonify({"status": "ok", "device": device,
-                    "tts_available": TTS_AVAILABLE, **d})
+                    "tts_available": TTS_AVAILABLE,
+                    "haptic_pulse_min_ms":    HAPTIC_PULSE_MIN_MS,
+                    "haptic_pulse_max_ms":    HAPTIC_PULSE_MAX_MS,
+                    "haptic_interval_min_ms": HAPTIC_INTERVAL_MIN_MS,
+                    "haptic_interval_max_ms": HAPTIC_INTERVAL_MAX_MS,
+                    **d})
 
 # ── STARTUP ───────────────────────────────────────────────────────────
 def startup():

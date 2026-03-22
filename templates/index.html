@@ -25,7 +25,7 @@
   header { display:flex; align-items:center; justify-content:space-between; border-bottom:1px solid var(--border); padding-bottom:18px; margin-bottom:24px; }
   .logo { display:flex; align-items:center; gap:14px; }
   .logo-icon { width:44px; height:44px; border-radius:10px; background:linear-gradient(135deg,var(--accent),var(--accent2)); display:flex; align-items:center; justify-content:center; font-size:22px; box-shadow:0 0 20px rgba(37,99,235,0.4); }
-  h1 { font-family:'Roboto', sans-serif; font-size:26px; font-weight:900; background:linear-gradient(90deg,#ffffff,var(--accent2)); -webkit-background-clip:text; -webkit-text-fill-color:transparent; }
+  h1 { font-family:'Roboto', sans-serif; font-size:50px; font-weight:900; background:white; -webkit-background-clip:text; -webkit-text-fill-color:transparent; }
   .tagline { font-size:10px; color:var(--muted); letter-spacing:2px; text-transform:uppercase; margin-top:2px; }
 
   .status-bar { display:flex; gap:20px; }
@@ -34,7 +34,7 @@
   .dot.live { background:#22c55e; box-shadow:0 0 8px #22c55e; animation:pulse-dot 1.5s infinite; }
   @keyframes pulse-dot { 0%,100%{opacity:1;transform:scale(1)} 50%{opacity:0.5;transform:scale(0.8)} }
 
-  .controls { display:flex; gap:16px; margin-bottom:22px; flex-wrap:wrap; align-items:center; justify-content: space-between; }
+  .controls { display:flex; gap:16px; margin-bottom:22px; flex-wrap:wrap; align-items:center; }
   .dir-icon svg { width:22px; height:22px; display:block; margin:0 auto; }
   .select-wrap { position:relative; }
   select { appearance:none; background:var(--surface); border:1px solid var(--border); color:#ffffff; padding:9px 34px 9px 14px; border-radius:8px; font-family:'Roboto', sans-serif; font-size:12px; cursor:pointer; outline:none; transition:border-color 0.2s; }
@@ -154,6 +154,11 @@
     .main-grid { grid-template-columns:1fr; }
     .stats-row { grid-template-columns:repeat(2,1fr); }
   }
+  .logo-i{
+    width: 70px;
+    border-radius: 20px; /* rounded corners */
+  }
+  
 </style>
 </head>
 <body>
@@ -161,8 +166,10 @@
 
   <header>
     <div class="logo">
-      <div class="logo-icon">👁</div>
       <div>
+        <img class="logo-i" src="sonic_path_logo.png" alt="logo">
+    </div>
+    <div>
         <h1>Sonic Path</h1>
         <div class="tagline">Depth → Spatial Audio Assist for Visual Impairments</div>
       </div>
@@ -311,6 +318,25 @@ let beepState = {
   intervalMs: 800,   // ms between beeps (shorter = closer)
 };
 
+let lastVibrationTime = 0;
+
+async function fetchData() {
+    const res = await fetch('/data');
+    const data = await res.json();
+
+    if (data.haptic_enabled && data.haptic_pattern.length > 0) {
+        const now = Date.now();
+
+        // interval control (continuous vibration avoid karne ke liye)
+        if (now - lastVibrationTime > data.haptic_interval_ms) {
+            navigator.vibrate(data.haptic_pattern);
+            lastVibrationTime = now;
+        }
+    }
+}
+
+// har 100ms pe data fetch
+setInterval(fetchData, 100);
 // ══════════════════════════════════════════════════════════════════════
 // AUDIO ENGINE — parking sensor style
 // ══════════════════════════════════════════════════════════════════════
