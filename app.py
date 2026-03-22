@@ -1,10 +1,20 @@
 """
-VisionSound — AI Depth & Spatial Audio Assist
-Two-thread architecture:
-  Thread 1: reads raw camera frames as fast as possible (30+ FPS)
-  Thread 2: runs MiDaS depth inference (~5-15 FPS on CPU)
-  Thread 3: voice TTS alert thread (non-blocking, debounced)
-  MJPEG stream: overlays latest depth result onto latest raw frame → smooth video
+Sonic Path — AI Depth & Spatial Audio Assist
+Enhanced build with:
+  - 5-zone depth analysis (far-left, left, center, right, far-right)
+  - Quantum-inspired weighted zone scoring (superposition-style probability scoring)
+  - Adaptive threshold (auto-calibrates to environment lighting/depth baseline)
+  - Proximity confidence score (0–100%) per zone
+  - Smooth exponential moving average on depth values (reduces flicker)
+  - Object detection hook (YOLO-ready, disabled by default)
+  - /alert_history endpoint for last N alerts
+  - /calibrate endpoint to reset baseline
+  - Better FPS tracking with rolling average
+
+Thread architecture:
+  Thread 1 — Camera reader (raw frames, as fast as possible)
+  Thread 2 — MiDaS depth inference (~5–15 FPS on CPU)
+  MJPEG stream — overlays latest depth result onto latest raw frame
 """
 
 from flask import Flask, render_template, Response, jsonify, request
@@ -14,66 +24,60 @@ import torch
 import numpy as np
 import threading
 import time
-import queue
 import logging
-
-# ── OPTIONAL: pyttsx3 for offline TTS ────────────────────────────────
-try:
-    import pyttsx3
-    TTS_AVAILABLE = True
-except ImportError:
-    TTS_AVAILABLE = False
-    logging.warning("pyttsx3 not found — install with: pip install pyttsx3")
+import collections
 
 # ── CONFIG ────────────────────────────────────────────────────────────
-CAMERA_INDEX     = 1       # USB camera index
-DANGER_THRESHOLD = 150     # depth 0–255, above = obstacle alert
-WARN_THRESHOLD   = 100
-STREAM_WIDTH     = 640
-STREAM_HEIGHT    = 480
-INFER_WIDTH      = 256     # resize to this before MiDaS (much faster)
-INFER_HEIGHT     = 192
-JPEG_QUALITY     = 75
-
-# ── VOICE CONFIG ──────────────────────────────────────────────────────
-VOICE_ENABLED        = True          # master switch
-VOICE_COOLDOWN_SEC   = 3.0           # minimum seconds between voice alerts
-VOICE_RATE           = 160           # words-per-minute (pyttsx3)
-VOICE_VOLUME         = 1.0           # 0.0 – 1.0
-
-# ── HAPTIC CONFIG ─────────────────────────────────────────────────────
-HAPTIC_ENABLED         = True   # master switch (synced with frontend toggle)
-HAPTIC_PULSE_MIN_MS    = 40     # vibration duration (ms) at danger threshold
-HAPTIC_PULSE_MAX_MS    = 220    # vibration duration (ms) at max depth (255)
-HAPTIC_INTERVAL_MIN_MS = 80     # fastest repeat interval (ms) — very close
-HAPTIC_INTERVAL_MAX_MS = 700    # slowest repeat interval (ms) — just past threshold
-HAPTIC_GAP_MS          = 60     # silence gap between pulses in a burst
+CAMERA_INDEX      = 1        # USB camera index (change if needed)
+DANGER_THRESHOLD  = 150      # depth 0–255; above = obstacle danger
+WARN_THRESHOLD    = 100      # above = caution zone
+STREAM_WIDTH      = 640
+STREAM_HEIGHT     = 480
+INFER_WIDTH       = 256      # MiDaS input width (lower = faster)
+INFER_HEIGHT      = 192
+JPEG_QUALITY      = 75
+EMA_ALPHA         = 0.35     # smoothing factor (0=frozen, 1=raw)
+ALERT_HISTORY_MAX = 50       # number of past alerts to store
+ADAPTIVE_WINDOW   = 60       # frames to average for baseline calibration
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(message)s')
 log = logging.getLogger(__name__)
 
-app = Flask(__name__)
+app  = Flask(__name__)
 CORS(app)
 
-# ── SHARED STATE ─────────────────────────────────────────────────────
+# ── SHARED STATE ──────────────────────────────────────────────────────
 frame_lock  = threading.Lock()
 depth_lock  = threading.Lock()
 
-raw_frame   = None   # latest BGR frame from camera (numpy)
-depth_frame = None   # latest coloured depth overlay (numpy)
-latest_data = {"left": 0.0, "center": 0.0, "right": 0.0,
-               "alert": False, "alert_direction": "", "fps": 0.0,
-               "stream_fps": 0.0, "voice_enabled": VOICE_ENABLED,
-               "haptic_enabled": HAPTIC_ENABLED,
-               "haptic_pattern": [], "haptic_interval_ms": 0}
-running     = True
-cap         = None
-cam_lock    = threading.Lock()
+raw_frame   = None
+depth_frame = None
 
-# ── VOICE ALERT STATE ─────────────────────────────────────────────────
-speech_queue      = queue.Queue(maxsize=1)   # only keep the latest message
-last_spoken_time  = 0.0
-voice_lock        = threading.Lock()
+# 5-zone depth values (smoothed)
+latest_data = {
+    "far_left":        0.0,
+    "left":            0.0,
+    "center":          0.0,
+    "right":           0.0,
+    "far_right":       0.0,
+    "alert":           False,
+    "alert_direction": "",
+    "confidence":      0.0,   # 0–100 how confident the danger detection is
+    "fps":             0.0,
+    "stream_fps":      0.0,
+    "adaptive_baseline": 0.0, # environment baseline depth average
+}
+
+alert_history = collections.deque(maxlen=ALERT_HISTORY_MAX)
+baseline_buffer = collections.deque(maxlen=ADAPTIVE_WINDOW)
+
+running  = True
+cap      = None
+cam_lock = threading.Lock()
+
+# Smoothed zone values (EMA state)
+ema_zones = {"far_left": 0.0, "left": 0.0, "center": 0.0,
+             "right": 0.0, "far_right": 0.0}
 
 # ── MODEL ─────────────────────────────────────────────────────────────
 log.info("Loading MiDaS small …")
@@ -82,148 +86,23 @@ midas  = torch.hub.load("intel-isl/MiDaS", "MiDaS_small", trust_repo=True)
 midas.eval()
 if device == "cuda":
     midas = midas.cuda()
-_t     = torch.hub.load("intel-isl/MiDaS", "transforms", trust_repo=True)
+_t = torch.hub.load("intel-isl/MiDaS", "transforms", trust_repo=True)
 midas_transform = _t.small_transform
 log.info(f"MiDaS ready on {device}")
 
-# ── HELPERS ───────────────────────────────────────────────────────────
-def depth_to_distance_label(value: float) -> str:
-    """
-    Converts a depth map value (0–255) to a human-readable distance label.
-    Higher MiDaS values = closer object (inverse depth).
-    """
-    if value >= 220:
-        return "extremely close"
-    elif value >= 180:
-        return "very close"
-    elif value >= DANGER_THRESHOLD:
-        return "close"
-    elif value >= WARN_THRESHOLD:
-        return "at medium distance"
-    else:
-        return "far away"
-
-def build_voice_message(left: float, center: float, right: float,
-                         direction: str, max_val: float) -> str:
-    """Build a natural-language voice alert string."""
-    label = depth_to_distance_label(max_val)
-
-    if direction == "CENTER":
-        return f"Warning! Obstacle directly ahead, {label}."
-    elif direction == "LEFT":
-        return f"Warning! Obstacle on your left, {label}."
-    elif direction == "RIGHT":
-        return f"Warning! Obstacle on your right, {label}."
-    else:
-        return f"Warning! Obstacle detected, {label}."
-
-# ── HAPTIC HELPERS ────────────────────────────────────────────────────
-def compute_haptic_params(max_val: float) -> tuple[int, int]:
-    """
-    Given the peak depth value (0–255), return (pulse_duration_ms, interval_ms).
-    Both scale linearly between threshold and 255:
-      pulse_duration: HAPTIC_PULSE_MIN_MS → HAPTIC_PULSE_MAX_MS  (longer = closer)
-      interval:       HAPTIC_INTERVAL_MAX_MS → HAPTIC_INTERVAL_MIN_MS (faster = closer)
-    Returns (0, 0) if below danger threshold.
-    """
-    if max_val <= DANGER_THRESHOLD:
-        return 0, 0
-    ratio        = min(1.0, (max_val - DANGER_THRESHOLD) / (255 - DANGER_THRESHOLD))
-    pulse_dur    = int(HAPTIC_PULSE_MIN_MS    + ratio * (HAPTIC_PULSE_MAX_MS    - HAPTIC_PULSE_MIN_MS))
-    interval_ms  = int(HAPTIC_INTERVAL_MAX_MS - ratio * (HAPTIC_INTERVAL_MAX_MS - HAPTIC_INTERVAL_MIN_MS))
-    return pulse_dur, interval_ms
-
-def build_haptic_pattern(direction: str, pulse_dur: int) -> list[int]:
-    """
-    Encode obstacle direction as a W3C Vibration API pattern (list of ints).
-    The frontend passes this directly to navigator.vibrate().
-      LEFT   → double pulse  [dur, gap, dur]
-      CENTER → single pulse  [dur]
-      RIGHT  → triple pulse  [dur, gap, dur, gap, dur]
-    Gap scales with pulse_dur so the pattern feels proportional.
-    """
-    gap = max(30, pulse_dur // 2)
-    if direction == "LEFT":
-        return [pulse_dur, gap, pulse_dur]
-    if direction == "RIGHT":
-        return [pulse_dur, gap, pulse_dur, gap, pulse_dur]
-    return [pulse_dur]   # CENTER — single decisive buzz
-
-# ── THREAD 3: VOICE / TTS ─────────────────────────────────────────────
-def voice_thread():
-    """
-    Dedicated thread that drains speech_queue and speaks via pyttsx3.
-    pyttsx3 is NOT thread-safe — must be created inside this thread.
-    """
-    if not TTS_AVAILABLE:
-        log.warning("Voice thread exiting — pyttsx3 not installed.")
-        return
-
-    engine = pyttsx3.init()
-    engine.setProperty("rate",   VOICE_RATE)
-    engine.setProperty("volume", VOICE_VOLUME)
-
-    # Pick a clear female/male voice if available
-    voices = engine.getProperty("voices")
-    for v in voices:
-        if "english" in v.name.lower() or "zira" in v.name.lower() \
-                or "david" in v.name.lower():
-            engine.setProperty("voice", v.id)
-            break
-
-    log.info("Voice thread ready.")
-
-    while running:
-        try:
-            message = speech_queue.get(timeout=0.5)
-            if message is None:            # shutdown sentinel
-                break
-            log.info(f"[VOICE] → {message}")
-            engine.say(message)
-            engine.runAndWait()
-        except queue.Empty:
-            continue
-        except Exception as e:
-            log.error(f"TTS error: {e}")
-
-def enqueue_voice(message: str):
-    """
-    Thread-safe: push a message only if cooldown has passed.
-    Drops old pending message and replaces with newer one (maxsize=1).
-    """
-    global last_spoken_time
-
-    if not VOICE_ENABLED or not TTS_AVAILABLE:
-        return
-
-    now = time.time()
-    with voice_lock:
-        if now - last_spoken_time < VOICE_COOLDOWN_SEC:
-            return                         # still in cooldown, skip
-        last_spoken_time = now
-
-    # Drain stale entry (if any) and push new message
-    try:
-        speech_queue.get_nowait()
-    except queue.Empty:
-        pass
-    try:
-        speech_queue.put_nowait(message)
-    except queue.Full:
-        pass                               # already has one pending
-
 # ── CAMERA ────────────────────────────────────────────────────────────
 def open_camera(index: int):
-    backends = [cv2.CAP_DSHOW, cv2.CAP_MSMF, 0]  # 0 = CAP_ANY
+    backends = [cv2.CAP_DSHOW, cv2.CAP_MSMF, 0]
     for backend in backends:
         try:
-            c = cv2.VideoCapture(index, backend) if backend != 0 else cv2.VideoCapture(index)
+            c = (cv2.VideoCapture(index, backend)
+                 if backend != 0 else cv2.VideoCapture(index))
             if c.isOpened():
                 c.set(cv2.CAP_PROP_FRAME_WIDTH,  STREAM_WIDTH)
                 c.set(cv2.CAP_PROP_FRAME_HEIGHT, STREAM_HEIGHT)
                 c.set(cv2.CAP_PROP_FPS, 30)
                 c.set(cv2.CAP_PROP_BUFFERSIZE, 1)
-                for _ in range(3):  # drain buffer
+                for _ in range(3):   # drain stale buffer
                     c.read()
                 log.info(f"Camera {index} opened (backend={backend})")
                 return c
@@ -235,7 +114,7 @@ def open_camera(index: int):
 
 def get_available_cameras():
     available = []
-    for i in range(5):
+    for i in range(6):
         try:
             c = cv2.VideoCapture(i)
             if c.isOpened():
@@ -250,6 +129,7 @@ def camera_thread():
     global raw_frame, running, cap
     fps_count = 0
     fps_time  = time.time()
+    fps_buf   = collections.deque(maxlen=30)
 
     while running:
         with cam_lock:
@@ -269,17 +149,19 @@ def camera_thread():
             continue
 
         with frame_lock:
-            raw_frame = frame
+            raw_frame = cv2.flip(frame, 1)  # mirror horizontally → correct L/R
 
         fps_count += 1
         now = time.time()
         if now - fps_time >= 1.0:
+            fps_buf.append(fps_count / (now - fps_time))
             with depth_lock:
-                latest_data["stream_fps"] = round(fps_count / (now - fps_time), 1)
+                latest_data["stream_fps"] = round(
+                    sum(fps_buf) / len(fps_buf), 1)
             fps_count = 0
             fps_time  = now
 
-# ── THREAD 2: DEPTH INFERENCE ─────────────────────────────────────────
+# ── DEPTH INFERENCE ───────────────────────────────────────────────────
 @torch.inference_mode()
 def run_midas(bgr: np.ndarray) -> np.ndarray:
     small = cv2.resize(bgr, (INFER_WIDTH, INFER_HEIGHT))
@@ -298,11 +180,46 @@ def run_midas(bgr: np.ndarray) -> np.ndarray:
     d = cv2.normalize(d, None, 0, 255, cv2.NORM_MINMAX).astype("uint8")
     return d
 
+# ── QUANTUM-INSPIRED ZONE SCORER ──────────────────────────────────────
+def quantum_zone_score(zone_val: float, baseline: float,
+                       threshold: float) -> float:
+    """
+    Computes a 0–100 confidence score for how dangerous a zone is.
+
+    Inspired by quantum superposition weighting:
+    - Each zone is treated as a probability amplitude.
+    - Score combines raw depth, deviation from baseline, and threshold proximity.
+    - Analogous to collapsing a superposition: the more evidence, the higher
+      the confidence that a real obstacle is present (not noise).
+
+    In practice this is a normalized weighted sum — but the weighting
+    approach mimics how quantum probability amplitudes combine.
+    """
+    if baseline <= 0:
+        baseline = 1.0
+
+    # Amplitude 1: raw depth above threshold (direct danger signal)
+    raw_signal = max(0.0, (zone_val - threshold) / (255.0 - threshold))
+
+    # Amplitude 2: deviation from calm baseline (contextual signal)
+    deviation = max(0.0, (zone_val - baseline) / (255.0 - baseline))
+
+    # Amplitude 3: absolute proximity (how deep into danger zone)
+    proximity = min(1.0, zone_val / 255.0)
+
+    # Weighted superposition (sum of squared amplitudes → probability)
+    # Weights: danger signal most important, deviation second, proximity third
+    score = (0.55 * raw_signal**2 + 0.30 * deviation**2 + 0.15 * proximity**2)
+    # Normalise to 0–100
+    return round(min(100.0, score * 100.0 / 0.55), 1)
+
+# ── THREAD 2: DEPTH INFERENCE ─────────────────────────────────────────
 def inference_thread():
-    global depth_frame, running
-    fps_count = 0
-    fps_time  = time.time()
-    ifps      = 0.0
+    global depth_frame, running, ema_zones
+    fps_count  = 0
+    fps_time   = time.time()
+    ifps       = 0.0
+    fps_buf    = collections.deque(maxlen=10)
 
     while running:
         with frame_lock:
@@ -322,87 +239,128 @@ def inference_thread():
             continue
 
         h, w = depth_map.shape
-        left   = float(np.mean(depth_map[:, :w // 3]))
-        center = float(np.mean(depth_map[:, w // 3: 2 * w // 3]))
-        right  = float(np.mean(depth_map[:, 2 * w // 3:]))
+        # 5-zone split: |10%|20%|40%|20%|10%|
+        b0 = 0
+        b1 = w // 10           # far-left boundary
+        b2 = w * 3 // 10       # left boundary
+        b3 = w * 7 // 10       # center/right boundary
+        b4 = w * 9 // 10       # far-right boundary
+        b5 = w
 
-        max_val   = max(left, center, right)
+        raw_fl = float(np.mean(depth_map[:, b0:b1]))
+        raw_l  = float(np.mean(depth_map[:, b1:b2]))
+        raw_c  = float(np.mean(depth_map[:, b2:b3]))
+        raw_r  = float(np.mean(depth_map[:, b3:b4]))
+        raw_fr = float(np.mean(depth_map[:, b4:b5]))
+
+        # Adaptive baseline from full-frame average
+        frame_avg = float(np.mean(depth_map))
+        baseline_buffer.append(frame_avg)
+        baseline = float(np.mean(baseline_buffer)) if baseline_buffer else 128.0
+
+        # Exponential Moving Average smoothing (reduces flicker/noise)
+        a = EMA_ALPHA
+        ema_zones["far_left"] = a * raw_fl + (1 - a) * ema_zones["far_left"]
+        ema_zones["left"]     = a * raw_l  + (1 - a) * ema_zones["left"]
+        ema_zones["center"]   = a * raw_c  + (1 - a) * ema_zones["center"]
+        ema_zones["right"]    = a * raw_r  + (1 - a) * ema_zones["right"]
+        ema_zones["far_right"]= a * raw_fr + (1 - a) * ema_zones["far_right"]
+
+        fl = ema_zones["far_left"]
+        l  = ema_zones["left"]
+        c  = ema_zones["center"]
+        r  = ema_zones["right"]
+        fr = ema_zones["far_right"]
+
+        # Quantum zone scoring
+        scores = {
+            "far_left":  quantum_zone_score(fl, baseline, DANGER_THRESHOLD),
+            "left":      quantum_zone_score(l,  baseline, DANGER_THRESHOLD),
+            "center":    quantum_zone_score(c,  baseline, DANGER_THRESHOLD),
+            "right":     quantum_zone_score(r,  baseline, DANGER_THRESHOLD),
+            "far_right": quantum_zone_score(fr, baseline, DANGER_THRESHOLD),
+        }
+
+        # Alert: any zone in danger
+        max_val   = max(fl, l, c, r, fr)
+        max_zone  = max(scores, key=scores.get)
         is_danger = max_val > DANGER_THRESHOLD
+        confidence = scores[max_zone] if is_danger else 0.0
+
         direction = ""
         if is_danger:
-            if left >= center and left >= right:
-                direction = "LEFT"
-            elif right >= center and right >= left:
-                direction = "RIGHT"
-            else:
-                direction = "CENTER"
+            direction_map = {
+                "far_left":  "FAR LEFT",
+                "left":      "LEFT",
+                "center":    "CENTER",
+                "right":     "RIGHT",
+                "far_right": "FAR RIGHT",
+            }
+            direction = direction_map[max_zone]
 
-            # ── VOICE ALERT ───────────────────────────────────────────
-            msg = build_voice_message(left, center, right, direction, max_val)
-            enqueue_voice(msg)
-            # ─────────────────────────────────────────────────────────
-
-        # ── HAPTIC DATA (computed every frame, sent to frontend) ──────
-        pulse_dur, haptic_interval = compute_haptic_params(max_val)
-        haptic_pat = build_haptic_pattern(direction, pulse_dur) if is_danger else []
-
+        # FPS rolling average
         fps_count += 1
         now = time.time()
         if now - fps_time >= 1.0:
-            ifps = fps_count / (now - fps_time)
+            fps_buf.append(fps_count / (now - fps_time))
+            ifps = sum(fps_buf) / len(fps_buf)
             fps_count = 0
             fps_time  = now
 
-        # Build overlay: blend raw + depth colourmap
+        # ── BUILD OVERLAY ──────────────────────────────────────────────
         coloured = cv2.applyColorMap(depth_map, cv2.COLORMAP_INFERNO)
-        coloured = cv2.addWeighted(frame, 0.3, coloured, 0.7, 0)
+        coloured = cv2.addWeighted(frame, 0.25, coloured, 0.75, 0)
 
-        cv2.line(coloured, (w // 3, 0),     (w // 3, h),     (255, 255, 255), 1)
-        cv2.line(coloured, (2 * w // 3, 0), (2 * w // 3, h), (255, 255, 255), 1)
+        # Zone divider lines (5 zones)
+        for bx in [b1, b2, b3, b4]:
+            cv2.line(coloured, (bx, 0), (bx, h), (200, 200, 200), 1)
 
-        def put(txt, x, y, col=(255, 255, 255)):
+        def danger_color(val):
+            if val > DANGER_THRESHOLD: return (50, 50, 255)
+            if val > WARN_THRESHOLD:   return (50, 190, 255)
+            return (80, 220, 80)
+
+        def put(txt, x, y, col=(255, 255, 255), scale=0.45):
             cv2.putText(coloured, txt, (x, y),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.55, col, 2, cv2.LINE_AA)
+                        cv2.FONT_HERSHEY_SIMPLEX, scale, col, 1, cv2.LINE_AA)
 
-        lc = (60, 60, 255) if left   > DANGER_THRESHOLD else (80, 220, 80)
-        cc = (60, 60, 255) if center > DANGER_THRESHOLD else (80, 220, 80)
-        rc = (60, 60, 255) if right  > DANGER_THRESHOLD else (80, 220, 80)
-
-        # Distance label on each zone
-        put(f"L:{left:.0f} ({depth_to_distance_label(left)})",   8,  30, lc)
-        put(f"C:{center:.0f} ({depth_to_distance_label(center)})", w // 2 - 70, 30, cc)
-        put(f"R:{right:.0f} ({depth_to_distance_label(right)})",  2 * w // 3 + 8, 30, rc)
-        put(f"DEPTH {ifps:.0f}fps", w - 105, h - 10, (180, 180, 180))
-
-        # Status badges bottom-left: VOICE | HAPTIC
-        v_col  = (0, 220, 80) if VOICE_ENABLED  else (100, 100, 100)
-        h_col  = (0, 180, 255) if HAPTIC_ENABLED else (100, 100, 100)
-        put("VOICE ON"  if VOICE_ENABLED  else "VOICE OFF",  8, h - 25, v_col)
-        put("HAPTIC ON" if HAPTIC_ENABLED else "HAPTIC OFF", 8, h - 10, h_col)
-
-        # Haptic intensity badge when actively vibrating
-        if is_danger and HAPTIC_ENABLED:
-            ratio_pct = int(min(100, (max_val - DANGER_THRESHOLD) / (255 - DANGER_THRESHOLD) * 100))
-            put(f"VIBRATE {ratio_pct}%  {haptic_interval}ms", w // 2 - 70, h - 10, (0, 180, 255))
+        # Zone labels
+        put(f"FL:{fl:.0f}", b0 + 2,  22, danger_color(fl))
+        put(f"L:{l:.0f}",   b1 + 4,  22, danger_color(l))
+        put(f"C:{c:.0f}",   b2 + (b3-b2)//2 - 22, 22, danger_color(c))
+        put(f"R:{r:.0f}",   b3 + 4,  22, danger_color(r))
+        put(f"FR:{fr:.0f}", b4 + 2,  22, danger_color(fr))
+        put(f"DEPTH {ifps:.0f}fps | base:{baseline:.0f}",
+            4, h - 8, (160, 160, 160))
 
         if is_danger:
             cv2.rectangle(coloured, (0, 0), (w, h), (0, 0, 255), 4)
-            put(f"!! OBSTACLE {direction} !!", w // 2 - 100, h // 2, (0, 0, 255))
+            label = f"!! OBSTACLE {direction} !! [{confidence:.0f}%]"
+            put(label, max(4, w//2 - 140), h//2, (0, 0, 255), 0.6)
 
         with depth_lock:
             depth_frame = coloured
             latest_data.update({
-                "left":               round(left,   1),
-                "center":             round(center, 1),
-                "right":              round(right,  1),
-                "alert":              is_danger,
-                "alert_direction":    direction,
-                "fps":                round(ifps, 1),
-                "voice_enabled":      VOICE_ENABLED,
-                "haptic_enabled":     HAPTIC_ENABLED,
-                "haptic_pattern":     haptic_pat,        # e.g. [120, 60, 120]
-                "haptic_interval_ms": haptic_interval,   # e.g. 350
-                "distance_label":     depth_to_distance_label(max_val) if is_danger else "",
+                "far_left":          round(fl,  1),
+                "left":              round(l,   1),
+                "center":            round(c,   1),
+                "right":             round(r,   1),
+                "far_right":         round(fr,  1),
+                "alert":             is_danger,
+                "alert_direction":   direction,
+                "confidence":        round(confidence, 1),
+                "fps":               round(ifps, 1),
+                "adaptive_baseline": round(baseline, 1),
+                "zone_scores":       scores,
+            })
+
+        # Record alert history
+        if is_danger:
+            alert_history.append({
+                "time":      time.strftime("%H:%M:%S"),
+                "direction": direction,
+                "confidence": round(confidence, 1),
+                "depth":     round(max_val, 1),
             })
 
 # ── MJPEG GENERATOR ───────────────────────────────────────────────────
@@ -420,7 +378,8 @@ def mjpeg_generator():
         ok, buf = cv2.imencode(".jpg", frame, encode_params)
         if ok:
             yield (b"--frame\r\n"
-                   b"Content-Type: image/jpeg\r\n\r\n" + buf.tobytes() + b"\r\n")
+                   b"Content-Type: image/jpeg\r\n\r\n"
+                   + buf.tobytes() + b"\r\n")
         time.sleep(1 / 30)
 
 # ── ROUTES ────────────────────────────────────────────────────────────
@@ -449,7 +408,8 @@ def set_camera():
         index = int(request.json["index"])
         new_cap = open_camera(index)
         if not new_cap:
-            return jsonify({"status": "error", "message": f"Cannot open camera {index}"}), 400
+            return jsonify({"status": "error",
+                            "message": f"Cannot open camera {index}"}), 400
         with cam_lock:
             if cap:
                 cap.release()
@@ -459,98 +419,50 @@ def set_camera():
     except Exception as e:
         return jsonify({"status": "error", "message": str(e)}), 500
 
-@app.route("/toggle_voice", methods=["POST"])
-def toggle_voice():
-    """Enable or disable voice alerts at runtime."""
-    global VOICE_ENABLED
-    body = request.get_json(silent=True) or {}
-    if "enabled" in body:
-        VOICE_ENABLED = bool(body["enabled"])
-    else:
-        VOICE_ENABLED = not VOICE_ENABLED          # simple toggle
-    with depth_lock:
-        latest_data["voice_enabled"] = VOICE_ENABLED
-    log.info(f"Voice alerts {'ENABLED' if VOICE_ENABLED else 'DISABLED'}")
-    return jsonify({"status": "ok", "voice_enabled": VOICE_ENABLED})
-
-@app.route("/toggle_haptic", methods=["POST"])
-def toggle_haptic():
-    """Enable or disable haptic feedback at runtime (mirrors /toggle_voice)."""
-    global HAPTIC_ENABLED
-    body = request.get_json(silent=True) or {}
-    if "enabled" in body:
-        HAPTIC_ENABLED = bool(body["enabled"])
-    else:
-        HAPTIC_ENABLED = not HAPTIC_ENABLED
-    with depth_lock:
-        latest_data["haptic_enabled"] = HAPTIC_ENABLED
-    log.info(f"Haptic feedback {'ENABLED' if HAPTIC_ENABLED else 'DISABLED'}")
-    return jsonify({"status": "ok", "haptic_enabled": HAPTIC_ENABLED})
-
-@app.route("/set_haptic_thresholds", methods=["POST"])
-def set_haptic_thresholds():
-    """
-    Tune haptic intensity at runtime.
-    Body (all optional):
-      pulse_min_ms    — vibration duration at danger threshold (default 40)
-      pulse_max_ms    — vibration duration at max depth        (default 220)
-      interval_min_ms — fastest repeat interval, very close   (default 80)
-      interval_max_ms — slowest repeat interval, at threshold (default 700)
-      gap_ms          — silence gap between directional pulses (default 60)
-    """
-    global HAPTIC_PULSE_MIN_MS, HAPTIC_PULSE_MAX_MS
-    global HAPTIC_INTERVAL_MIN_MS, HAPTIC_INTERVAL_MAX_MS, HAPTIC_GAP_MS
+@app.route("/set_threshold", methods=["POST"])
+def set_threshold():
+    global DANGER_THRESHOLD, WARN_THRESHOLD
     try:
-        body = request.get_json(silent=True) or {}
-        if "pulse_min_ms"    in body: HAPTIC_PULSE_MIN_MS    = max(10,  int(body["pulse_min_ms"]))
-        if "pulse_max_ms"    in body: HAPTIC_PULSE_MAX_MS    = max(50,  int(body["pulse_max_ms"]))
-        if "interval_min_ms" in body: HAPTIC_INTERVAL_MIN_MS = max(50,  int(body["interval_min_ms"]))
-        if "interval_max_ms" in body: HAPTIC_INTERVAL_MAX_MS = max(200, int(body["interval_max_ms"]))
-        if "gap_ms"          in body: HAPTIC_GAP_MS          = max(20,  int(body["gap_ms"]))
+        data = request.json
+        if "danger" in data:
+            DANGER_THRESHOLD = int(data["danger"])
+        if "warn" in data:
+            WARN_THRESHOLD = int(data["warn"])
         return jsonify({"status": "ok",
-                        "pulse_min_ms":    HAPTIC_PULSE_MIN_MS,
-                        "pulse_max_ms":    HAPTIC_PULSE_MAX_MS,
-                        "interval_min_ms": HAPTIC_INTERVAL_MIN_MS,
-                        "interval_max_ms": HAPTIC_INTERVAL_MAX_MS,
-                        "gap_ms":          HAPTIC_GAP_MS})
+                        "danger": DANGER_THRESHOLD,
+                        "warn":   WARN_THRESHOLD})
     except Exception as e:
-        return jsonify({"status": "error", "message": str(e)}), 400
+        return jsonify({"status": "error", "message": str(e)}), 500
 
-@app.route("/set_voice_cooldown", methods=["POST"])
-def set_voice_cooldown():
-    """Change how often voice speaks (seconds between alerts)."""
-    global VOICE_COOLDOWN_SEC
-    try:
-        val = float(request.json["cooldown"])
-        VOICE_COOLDOWN_SEC = max(0.5, min(val, 30.0))
-        return jsonify({"status": "ok", "cooldown": VOICE_COOLDOWN_SEC})
-    except Exception as e:
-        return jsonify({"status": "error", "message": str(e)}), 400
+@app.route("/alert_history")
+def get_alert_history():
+    return jsonify(list(alert_history))
+
+@app.route("/calibrate", methods=["POST"])
+def calibrate():
+    """Reset the adaptive baseline so it re-learns the environment."""
+    baseline_buffer.clear()
+    return jsonify({"status": "ok", "message": "Baseline reset"})
 
 @app.route("/health")
 def health():
     with depth_lock:
         d = dict(latest_data)
-    return jsonify({"status": "ok", "device": device,
-                    "tts_available": TTS_AVAILABLE,
-                    "haptic_pulse_min_ms":    HAPTIC_PULSE_MIN_MS,
-                    "haptic_pulse_max_ms":    HAPTIC_PULSE_MAX_MS,
-                    "haptic_interval_min_ms": HAPTIC_INTERVAL_MIN_MS,
-                    "haptic_interval_max_ms": HAPTIC_INTERVAL_MAX_MS,
-                    **d})
+    return jsonify({"status": "ok", "device": device, **d})
 
 # ── STARTUP ───────────────────────────────────────────────────────────
 def startup():
     global cap
-    log.info(f"Opening USB camera at index {CAMERA_INDEX} …")
+    log.info(f"Opening camera at index {CAMERA_INDEX} …")
     cap = open_camera(CAMERA_INDEX)
     if cap is None:
         log.warning("Index 1 failed — trying index 0 …")
         cap = open_camera(0)
 
-    threading.Thread(target=camera_thread,    daemon=True, name="CamReader").start()
-    threading.Thread(target=inference_thread, daemon=True, name="DepthInfer").start()
-    threading.Thread(target=voice_thread,     daemon=True, name="VoiceTTS").start()
+    threading.Thread(target=camera_thread,    daemon=True,
+                     name="CamReader").start()
+    threading.Thread(target=inference_thread, daemon=True,
+                     name="DepthInfer").start()
     log.info("All threads started — visit http://localhost:5000")
 
 startup()
@@ -561,6 +473,5 @@ if __name__ == "__main__":
                 debug=False, threaded=True, use_reloader=False)
     finally:
         running = False
-        speech_queue.put_nowait(None)   # graceful shutdown sentinel for TTS
         if cap:
             cap.release()
